@@ -1,0 +1,13 @@
+# Raw data files
+analysis/data/
+
+# PDF
+*.pdf
+
+# macOS
+.DS_Store
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
