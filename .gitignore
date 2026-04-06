@@ -4,6 +4,9 @@ analysis/data/
 # PDF
 *.pdf
 
+# Claude Code
+.claude/
+
 # macOS
 .DS_Store
 
