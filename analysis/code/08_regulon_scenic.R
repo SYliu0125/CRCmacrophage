@@ -156,6 +156,29 @@ regulonAUC <- getAUC(cells_AUC)
 cat(sprintf("  AUC matrix: %d regulons x %d cells\n", nrow(regulonAUC), ncol(regulonAUC)))
 
 # =========================================================================
+# PART D2: Binarize AUC matrix (active / inactive per cell per regulon)
+# k-means with k=2 per regulon; fallback to median split if k-means fails.
+# Binarization is required for DOR calculation (Part F2) and mirrors the
+# per-regulon threshold approach used in pySCENIC / SCopeLoomR output.
+# =========================================================================
+cat("Binarizing regulon AUC matrix...\n")
+
+binarize_regulon <- function(auc_vec) {
+  km <- tryCatch(
+    kmeans(auc_vec, centers = 2, nstart = 5, iter.max = 50),
+    error = function(e) NULL
+  )
+  if (is.null(km)) return(as.integer(auc_vec > median(auc_vec)))
+  high_cluster <- which.max(km$centers)
+  as.integer(km$cluster == high_cluster)
+}
+
+regulonAUC_bin <- t(apply(regulonAUC, 1, binarize_regulon))
+colnames(regulonAUC_bin) <- colnames(regulonAUC)
+cat(sprintf("  Mean activation rate across regulons: %.1f%%\n",
+            mean(regulonAUC_bin) * 100))
+
+# =========================================================================
 # PART E: Regulon activity heatmap by cluster
 # =========================================================================
 cat("\nGenerating regulon activity heatmap by cluster...\n")
@@ -263,7 +286,55 @@ if (length(macro_cells) > 50) {
   ) %>% arrange(desc(abs(Delta_dMMR_vs_Normal)))
   
   write.csv(fc_df, file.path(result_dir, "regulon_macrophage_condition_comparison.csv"), row.names = FALSE)
-  
+
+  # --- DOR: Diagnostic Odds Ratio using binarized AUC ---
+  # DOR = (TP*TN) / (FP*FN): ranks regulons by how well binarized activity
+  # predicts tumor macrophage state vs Normal. Borrowed from Karimi et al.
+  # (eLife 2024) where it ranked TFs specific to SPP1+MAM+ fibrotic macrophages.
+  cat("Computing DOR to rank regulons by condition-specificity...\n")
+
+  cal_DOR <- function(state_vec, activity_vec, positive_label) {
+    act <- factor(as.integer(activity_vec), levels = c(0, 1))
+    ct  <- table(state_vec, act)
+    if (!all(c(positive_label, "N") %in% rownames(ct))) return(NA)
+    if (ncol(ct) < 2) return(NA)
+    TP <- ct[positive_label, "1"]; FN <- ct[positive_label, "0"]
+    TN <- ct["N",             "0"]; FP <- ct["N",             "1"]
+    ((TP + 0.5) * (TN + 0.5)) / ((FP + 0.5) * (FN + 0.5))
+  }
+
+  # Get cells from regulonAUC_bin that are macrophages with valid condition
+  bin_macro_cells <- intersect(colnames(regulonAUC_bin), rownames(meta_sub))
+  bin_macro_cells <- bin_macro_cells[
+    meta_sub[bin_macro_cells, "cl295v11SubShort"] == "cM02" &
+    !is.na(meta_sub[bin_macro_cells, "Condition"])
+  ]
+
+  if (length(bin_macro_cells) > 30) {
+    state_all <- meta_sub[bin_macro_cells, "Condition"]
+
+    for (comp in c("MMRd", "MMRp")) {
+      pair_cells <- bin_macro_cells[state_all %in% c("N", comp)]
+      pair_state <- meta_sub[pair_cells, "Condition"]
+
+      dor_vec <- sapply(rownames(regulonAUC_bin), function(reg) {
+        cal_DOR(pair_state, regulonAUC_bin[reg, pair_cells], comp)
+      })
+
+      dor_df <- data.frame(
+        Regulon   = names(dor_vec),
+        DOR       = dor_vec,
+        log10_DOR = log10(pmax(dor_vec, 1e-3))
+      ) %>% arrange(desc(DOR))
+
+      write.csv(dor_df,
+                file.path(result_dir, paste0("regulon_DOR_macrophage_", comp, "_vs_Normal.csv")),
+                row.names = FALSE)
+      cat(sprintf("  Top regulons for %s vs Normal (DOR):\n", comp))
+      print(head(dor_df[, c("Regulon", "DOR")], 5))
+    }
+  }
+
   cat("\n--- Regulon Activity Changes in Macrophages (vs Normal) ---\n")
   cat("  Two parallel comparisons: Normal→pMMR  and  Normal→dMMR\n")
   print(head(fc_df[, c("Regulon", "Delta_pMMR_vs_Normal", "Delta_dMMR_vs_Normal")], 10))

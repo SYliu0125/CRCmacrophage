@@ -357,6 +357,8 @@ for (comparison in list(
 # --- 8. Heatmap: condition-specific gene expression along pseudotime ---
 cat("Generating condition-specific trajectory heatmaps...\n")
 
+expr_data <- GetAssayData(seu_cond, slot = "data", assay = "RNA")
+
 for (cond in c("N", "MMRp", "MMRd")) {
   cond_cells <- colnames(seu_cond)[seu_cond$Condition == cond]
   cond_pt <- seu_cond$slingshot_pt1[cond_cells]
@@ -439,7 +441,7 @@ cat(sprintf("  Trajectory-associated genes (p < 0.01): %d\n",
 if (length(top_traj_genes) > 5) {
   cat("Generating trajectory gene heatmap (all cells)...\n")
   
-  heatmap_genes <- intersect(top_traj_genes, rownames(expr_data))
+  heatmap_genes <- intersect(top_traj_genes, rownames(seu))
   valid_cells <- !is.na(seu$slingshot_pt1)
   valid_pt <- seu$slingshot_pt1[valid_cells]
   valid_expr <- GetAssayData(seu, slot = "data", assay = "RNA")[heatmap_genes, valid_cells]
@@ -481,14 +483,22 @@ if (requireNamespace("monocle3", quietly = TRUE) &
   library(SeuratWrappers)
   
   cat("Converting Seurat to Monocle3 CDS...\n")
-  cds <- as.cell_data_set(seu)
-  cds <- cluster_cells(cds, reduction_method = "UMAP")
-  
+  cds <- as.cell_data_set(seu, assay = "RNA")
+  # Inject existing Seurat UMAP coords and Harmony-corrected cluster labels.
+  # Avoids re-running Monocle3's own clustering, which would produce different
+  # partitions and break cross-method comparability with Slingshot (Part A/B).
+  recreate_partitions <- rep(1, ncol(cds))
+  names(recreate_partitions) <- colnames(cds)
+  cds@clusters@listData[["UMAP"]][["partitions"]] <- as.factor(recreate_partitions)
+  cds@clusters@listData[["UMAP"]][["clusters"]]   <- seu$cl295v11SubShort[colnames(cds)]
+  cds@int_colData@listData[["reducedDims"]]@listData[["UMAP"]] <-
+    Embeddings(seu, "umap")[colnames(cds), ]
+
   cat("Learning trajectory graph...\n")
   cds <- learn_graph(cds, use_partition = FALSE)
-  
+
   cat("Ordering cells (root: Monocytes)...\n")
-  monocyte_cells <- colnames(cds)[seu$cl295v11SubShort == "cM01"]
+  monocyte_cells <- colnames(cds)[seu$cl295v11SubShort[colnames(cds)] == "cM01"]
   cds <- order_cells(cds, root_cells = monocyte_cells[1:min(10, length(monocyte_cells))])
   
   seu$monocle3_pseudotime <- pseudotime(cds)
@@ -548,6 +558,119 @@ if (requireNamespace("monocle3", quietly = TRUE) &
   cat("  monocle3 or SeuratWrappers not available. Skipping.\n")
   cat("  Install: devtools::install_github('cole-trapnell-lab/monocle3')\n")
   cat("  Also: remotes::install_github('satijalab/seurat-wrappers')\n")
+}
+
+# =========================================================================
+# PART E: DIFFUSIONMAP-BASED CELL PROPENSITY SCORES
+# Adapted from Karimi et al. (eLife 2024, MAM macrophage paper):
+# Quantifies P(transitional myeloid cell reaches a terminal macrophage state)
+# per condition, revealing condition-specific fate commitment beyond pseudotime.
+# Dependencies: destiny, ggpubr
+# =========================================================================
+cat("\n=== DiffusionMap Propensity Scoring ===\n")
+
+if (requireNamespace("destiny",  quietly = TRUE) &&
+    requireNamespace("ggpubr",   quietly = TRUE)) {
+  library(destiny)
+  library(ggpubr)
+
+  # TODO(human): Define cluster roles for the CRC myeloid trajectory.
+  # Look at the marker outputs from 04_myeloid_analysis.R (dot plots, FindAllMarkers)
+  # to classify each cM01–cM10 cluster as:
+  #   "source"      – monocytes, trajectory root (cM01)
+  #   "transitional" – intermediate clusters without a committed phenotype
+  #   "terminal"    – terminally polarised macrophage end-states
+  # Also identify which terminal clusters are enriched in MMRp vs MMRd tumors
+  # (check the composition plots from 03_composition.R or 04_myeloid_analysis.R).
+  cluster_roles <- list(
+    transitional  = c("cM01"),       # TODO(human): add intermediate clusters
+    terminal_mmrp = c("cM02"),       # TODO(human): MMRp-enriched terminal clusters
+    terminal_mmrd = c("cM02")        # TODO(human): MMRd-enriched terminal clusters
+  )
+
+  propensity_calc <- function(seu_sub, dm, trans_clust, recv_clust, targ_clust,
+                               p_thresh = 0.05) {
+    Trans_t  <- dm@transitions / rowSums(dm@transitions)
+    int_c    <- intersect(colnames(Trans_t), colnames(seu_sub))
+    Trans_t  <- Trans_t[int_c, int_c]
+    is_valid <- rowSums(is.na(Trans_t)) == 0
+    clust    <- seu_sub$cl295v11SubShort[int_c]
+    cond     <- seu_sub$Condition[int_c]
+
+    do.call(rbind, lapply(unique(na.omit(cond)), function(d) {
+      is_d   <- cond == d & !is.na(cond)
+      i_src  <- clust %in% trans_clust & is_valid & is_d
+      i_recv <- clust %in% recv_clust  & is_valid & is_d
+      i_targ <- clust %in% targ_clust  & is_valid & is_d
+      if (sum(i_src) < 2) return(NULL)
+
+      r <- if (sum(i_recv) > 1) rowSums(Trans_t[i_src, i_recv, drop = FALSE]) else
+               Trans_t[i_src, which(i_recv), drop = TRUE]
+      s <- if (sum(i_targ) > 1) rowSums(Trans_t[i_src, i_targ, drop = FALSE]) else
+               Trans_t[i_src, which(i_targ), drop = TRUE]
+
+      q <- r + s; keep <- q > p_thresh
+      if (!any(keep)) return(NULL)
+      data.frame(Condition = d, propensity = (s / (r + s))[keep],
+                 cell_id = rownames(Trans_t)[i_src][keep])
+    }))
+  }
+
+  all_relevant <- unique(c(cluster_roles$transitional,
+                            cluster_roles$terminal_mmrp,
+                            cluster_roles$terminal_mmrd))
+  seu_dm <- subset(seu_cond, subset = cl295v11SubShort %in% all_relevant)
+  cat(sprintf("  DiffusionMap input: %d cells\n", ncol(seu_dm)))
+
+  dm_path <- file.path(result_dir, "diffusionmap_myeloid.rds")
+  if (file.exists(dm_path)) {
+    cat("  Loading saved DiffusionMap...\n")
+    dm <- readRDS(dm_path)
+  } else {
+    cat("  Building DiffusionMap (saved to rds for reuse)...\n")
+    sce_dm <- as.SingleCellExperiment(seu_dm, assay = "RNA")
+    dm <- DiffusionMap(sce_dm, verbose = FALSE,
+                       k = round(0.05 * ncol(seu_dm)), n_pcs = 30)
+    saveRDS(dm, dm_path)
+  }
+
+  prop_df <- propensity_calc(
+    seu_sub    = seu_dm,
+    dm         = dm,
+    trans_clust = cluster_roles$transitional,
+    recv_clust  = cluster_roles$terminal_mmrp,
+    targ_clust  = cluster_roles$terminal_mmrd
+  )
+
+  if (!is.null(prop_df) && nrow(prop_df) > 0) {
+    prop_df$Condition <- factor(prop_df$Condition, levels = c("N", "MMRp", "MMRd"))
+
+    p_prop_vln <- ggplot(prop_df,
+                         aes(x = Condition, y = propensity, fill = Condition)) +
+      geom_violin(adjust = 2, scale = "width", alpha = 0.8) +
+      geom_jitter(height = 0, width = 0.15, size = 0.5, alpha = 0.4) +
+      stat_summary(fun = median, geom = "crossbar",
+                   width = 0.5, colour = "white", linewidth = 0.3) +
+      scale_fill_manual(values = condition_colors) +
+      stat_compare_means(comparisons = list(c("MMRp", "N"), c("MMRd", "N")),
+                         method = "wilcox.test", size = 3.5) +
+      labs(title = "Macrophage Differentiation Propensity by Condition",
+           subtitle = "P(transitional cell reaches terminal macrophage state)",
+           y = "Propensity score", x = "") +
+      theme_cowplot() + NoLegend()
+
+    ggsave(file.path(result_dir, "propensity_violin_by_condition.pdf"),
+           p_prop_vln, width = 6, height = 6)
+    ggsave(file.path(result_dir, "propensity_violin_by_condition.png"),
+           p_prop_vln, width = 6, height = 6, dpi = 200)
+    write.csv(prop_df, file.path(result_dir, "propensity_scores_by_condition.csv"),
+              row.names = FALSE)
+    cat("  Propensity scores saved.\n")
+  }
+
+} else {
+  cat("  destiny or ggpubr not available. Skipping propensity analysis.\n")
+  cat("  Install: install.packages(c('destiny', 'ggpubr'))\n")
 }
 
 # --- Save ---
