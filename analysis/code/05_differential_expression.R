@@ -10,6 +10,13 @@
 #   Cluster marker contrasts (cM02 vs cM01) retain Wilcoxon via FindMarkers
 #     because these compare cell types within the same sample, not conditions
 #     across patients.
+#
+# ANALYSIS STEPS:
+#   Step 1 — Tumor vs Normal, all myeloid             → pseudobulk DESeq2
+#   Step 2 — MMRd vs MMRp, all myeloid                → pseudobulk DESeq2
+#   Step 3 — Tumor vs Normal, per myeloid subcluster  → pseudobulk DESeq2
+#   Step 4 — Macrophage (cM02) vs Monocyte (cM01)     → Wilcoxon (FindMarkers)
+#   Step 5 — Top DE genes heatmap                     → uses Step 1 output
 # =============================================================================
 
 library(Seurat)
@@ -28,104 +35,96 @@ cat("=== Phase 5: Differential Expression Analysis ===\n\n")
 result_dir <- "results/05_de"
 dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
 
-# --- 1. Load myeloid Seurat object ---
+# =============================================================================
+# LOAD DATA
+# Input:  results/04_myeloid/seu_myeloid.rds
+# Output: seu  — myeloid Seurat object with RNA assay normalized
+# =============================================================================
 cat("Loading myeloid Seurat object...\n")
 seu <- readRDS("results/04_myeloid/seu_myeloid.rds")
 DefaultAssay(seu) <- "RNA"
 seu <- NormalizeData(seu, verbose = FALSE)
 
-# =========================================================================
-# PSEUDOBULK HELPER FUNCTIONS
-# =========================================================================
 
-# Aggregate raw counts per PID x condition into a pseudobulk matrix.
-# Returns list(counts = matrix, coldata = data.frame)
-make_pseudobulk <- function(seu_sub, condition_col, min_cells = 10) {
-  counts <- GetAssayData(seu_sub, slot = "counts", assay = "RNA")
-  meta   <- seu_sub@meta.data[, c("PID", condition_col), drop = FALSE]
-  meta$pb_sample <- paste(meta$PID, meta[[condition_col]], sep = "__")
+# =============================================================================
+# STEP 1: Tumor vs Normal — all myeloid cells (pseudobulk DESeq2)
+# Input:  seu,  SPECIMEN_TYPE column  ("T" = tumor, "N" = normal)
+# Output: de_tumor_vs_normal_myeloid.csv
+#         volcano_tumor_vs_normal.pdf / .png
+#         de_tn  — kept in memory, used again in Step 5
+# =============================================================================
+cat("\n--- STEP 1: Tumor vs Normal (all myeloid) ---\n")
 
-  groups   <- unique(meta$pb_sample)
-  pb_list  <- lapply(groups, function(g) {
-    cells <- rownames(meta)[meta$pb_sample == g]
-    if (length(cells) < min_cells) return(NULL)
-    Matrix::rowSums(counts[, cells, drop = FALSE])
-  })
-  names(pb_list) <- groups
-  pb_list <- pb_list[!sapply(pb_list, is.null)]
+# 1a. Keep only tumor (T) and normal (N) cells
+seu_tn <- subset(seu, subset = SPECIMEN_TYPE %in% c("T", "N"))
 
-  pb_mat  <- do.call(cbind, pb_list)
+# 1b. Extract the raw (integer) count matrix: genes × cells
+counts_tn <- GetAssayData(seu_tn, slot = "counts", assay = "RNA")
 
-  coldata <- data.frame(
-    sample    = names(pb_list),
-    PID       = sub("__.*$",  "", names(pb_list)),
-    condition = sub("^.*__",  "", names(pb_list)),
-    row.names = names(pb_list),
-    stringsAsFactors = FALSE
-  )
-  colnames(coldata)[colnames(coldata) == "condition"] <- condition_col
+# 1c. Create a pseudobulk group label "PID__condition" for each cell.
+#     Cells from the same patient × same condition will be summed together.
+meta_tn <- seu_tn@meta.data[, c("PID", "SPECIMEN_TYPE")]
+meta_tn$pb_group <- paste(meta_tn$PID, meta_tn$SPECIMEN_TYPE, sep = "__")
 
-  list(counts = as.matrix(pb_mat), coldata = coldata)
-}
+# 1d. For each unique PID×condition group, sum raw counts across its cells.
+#     Groups with fewer than 10 cells are dropped (too sparse to be reliable).
+groups_tn <- unique(meta_tn$pb_group)
+pb_list_tn <- lapply(groups_tn, function(g) {
+  cells_in_group <- rownames(meta_tn)[meta_tn$pb_group == g]
+  if (length(cells_in_group) < 10) return(NULL)
+  Matrix::rowSums(counts_tn[, cells_in_group, drop = FALSE])
+})
+names(pb_list_tn) <- groups_tn
+pb_list_tn <- pb_list_tn[!sapply(pb_list_tn, is.null)]  # remove dropped groups
 
-# Run DESeq2 on a pseudobulk object.
-# level1 = numerator (e.g. "T"), level2 = denominator (e.g. "N")
-run_deseq2 <- function(pb, condition_col, level1, level2) {
-  coldata <- pb$coldata
-  coldata[[condition_col]] <- factor(coldata[[condition_col]],
-                                     levels = c(level2, level1))
+# 1e. Assemble into a gene × pseudobulk-sample count matrix
+pb_counts_tn <- do.call(cbind, pb_list_tn)
 
-  # Keep only samples belonging to the two levels being compared
-  keep_samples <- coldata[[condition_col]] %in% c(level1, level2)
-  coldata  <- coldata[keep_samples, , drop = FALSE]
-  pb_mat   <- pb$counts[, rownames(coldata), drop = FALSE]
-
-  # Require at least 3 samples per group
-  n1 <- sum(coldata[[condition_col]] == level1)
-  n2 <- sum(coldata[[condition_col]] == level2)
-  if (n1 < 3 | n2 < 3) {
-    warning(sprintf("Too few pseudobulk samples: %s n=%d, %s n=%d. Skipping.",
-                    level1, n1, level2, n2))
-    return(NULL)
-  }
-
-  # Filter lowly expressed genes (expressed in >= 2 samples)
-  keep_genes <- rowSums(pb_mat >= 1) >= 2
-  pb_mat <- pb_mat[keep_genes, ]
-
-  design_formula <- as.formula(paste0("~", condition_col))
-  dds <- DESeqDataSetFromMatrix(countData = pb_mat,
-                                colData   = coldata,
-                                design    = design_formula)
-  dds <- DESeq(dds, quiet = TRUE)
-  res <- results(dds, contrast = c(condition_col, level1, level2))
-
-  df <- as.data.frame(res)
-  df$gene <- rownames(df)
-  df
-}
-
-# =========================================================================
-# DE 1: Tumor vs Normal (all myeloid cells) — PSEUDOBULK
-# =========================================================================
-cat("\n--- DE: Tumor vs Normal (all myeloid) — Pseudobulk DESeq2 ---\n")
-
-seu_tn  <- subset(seu, subset = SPECIMEN_TYPE %in% c("T", "N"))
-pb_tn   <- make_pseudobulk(seu_tn, condition_col = "SPECIMEN_TYPE")
+# 1f. Build a sample metadata table (one row per pseudobulk sample)
+#     DESeq2 needs this to know which condition each column belongs to.
+pb_meta_tn <- data.frame(
+  sample         = names(pb_list_tn),
+  PID            = sub("__.*$", "", names(pb_list_tn)),   # extract patient ID
+  SPECIMEN_TYPE  = sub("^.*__", "", names(pb_list_tn)),   # extract T or N
+  row.names      = names(pb_list_tn),
+  stringsAsFactors = FALSE
+)
+pb_meta_tn$SPECIMEN_TYPE <- factor(pb_meta_tn$SPECIMEN_TYPE, levels = c("N", "T"))
+# N is the reference level (denominator); T is the numerator
 
 cat(sprintf("  Pseudobulk samples: %d total (T=%d, N=%d)\n",
-            nrow(pb_tn$coldata),
-            sum(pb_tn$coldata$SPECIMEN_TYPE == "T"),
-            sum(pb_tn$coldata$SPECIMEN_TYPE == "N")))
+            nrow(pb_meta_tn),
+            sum(pb_meta_tn$SPECIMEN_TYPE == "T"),
+            sum(pb_meta_tn$SPECIMEN_TYPE == "N")))
 
-de_tn <- run_deseq2(pb_tn, condition_col = "SPECIMEN_TYPE",
-                    level1 = "T", level2 = "N")
+# 1g. Require at least 3 pseudobulk samples per condition before running DESeq2
+stopifnot(sum(pb_meta_tn$SPECIMEN_TYPE == "T") >= 3,
+          sum(pb_meta_tn$SPECIMEN_TYPE == "N") >= 3)
+
+# 1h. Filter out genes expressed in fewer than 2 pseudobulk samples (too sparse)
+keep_genes_tn <- rowSums(pb_counts_tn >= 1) >= 2
+pb_counts_tn  <- pb_counts_tn[keep_genes_tn, ]
+
+# 1i. Create DESeq2 dataset object
+dds_tn <- DESeqDataSetFromMatrix(
+  countData = as.matrix(pb_counts_tn),
+  colData   = pb_meta_tn,
+  design    = ~ SPECIMEN_TYPE    # model: expression ~ condition
+)
+
+# 1j. Run DESeq2: estimate size factors, dispersion, and fit the model
+dds_tn <- DESeq(dds_tn, quiet = TRUE)
+
+# 1k. Extract results: log2FC and adjusted p-value for T vs N
+de_tn       <- as.data.frame(results(dds_tn, contrast = c("SPECIMEN_TYPE", "T", "N")))
+de_tn$gene  <- rownames(de_tn)
 
 write.csv(de_tn, file.path(result_dir, "de_tumor_vs_normal_myeloid.csv"), row.names = FALSE)
 cat(sprintf("  DE genes (|log2FC| > 0.5, padj < 0.05): up in Tumor=%d, up in Normal=%d\n",
             sum(de_tn$log2FoldChange >  0.5 & de_tn$padj < 0.05, na.rm = TRUE),
             sum(de_tn$log2FoldChange < -0.5 & de_tn$padj < 0.05, na.rm = TRUE)))
 
+# 1l. Volcano plot
 p_volcano_tn <- EnhancedVolcano(de_tn,
   lab = de_tn$gene, x = "log2FoldChange", y = "padj",
   title    = "Myeloid: Tumor vs Normal",
@@ -138,29 +137,82 @@ p_volcano_tn <- EnhancedVolcano(de_tn,
 ggsave(file.path(result_dir, "volcano_tumor_vs_normal.pdf"), p_volcano_tn, width = 10, height = 8)
 ggsave(file.path(result_dir, "volcano_tumor_vs_normal.png"), p_volcano_tn, width = 10, height = 8, dpi = 200)
 
-rm(seu_tn); gc()
+rm(seu_tn, counts_tn, meta_tn, pb_list_tn, pb_counts_tn, pb_meta_tn, dds_tn); gc()
 
-# =========================================================================
-# DE 2: MMRd vs MMRp (all myeloid cells) — PSEUDOBULK
-# =========================================================================
-cat("\n--- DE: MMRd vs MMRp (all myeloid) — Pseudobulk DESeq2 ---\n")
 
+# =============================================================================
+# STEP 2: MMRd vs MMRp — all myeloid cells (pseudobulk DESeq2)
+# Input:  seu,  MMRStatus column  ("MMRd" = mismatch repair deficient,
+#                                  "MMRp" = mismatch repair proficient)
+# Output: de_mmrd_vs_mmrp_myeloid.csv
+#         volcano_mmrd_vs_mmrp.pdf / .png
+# =============================================================================
+cat("\n--- STEP 2: MMRd vs MMRp (all myeloid) ---\n")
+
+# 2a. Keep only cells with known MMR status (excludes normal tissue)
 seu_mmr <- subset(seu, subset = MMRStatus %in% c("MMRd", "MMRp"))
-pb_mmr  <- make_pseudobulk(seu_mmr, condition_col = "MMRStatus")
+
+# 2b. Extract raw count matrix
+counts_mmr <- GetAssayData(seu_mmr, slot = "counts", assay = "RNA")
+
+# 2c. Pseudobulk group label: PID × MMRStatus
+meta_mmr <- seu_mmr@meta.data[, c("PID", "MMRStatus")]
+meta_mmr$pb_group <- paste(meta_mmr$PID, meta_mmr$MMRStatus, sep = "__")
+
+# 2d. Sum counts per PID × MMRStatus group (drop groups with < 10 cells)
+groups_mmr <- unique(meta_mmr$pb_group)
+pb_list_mmr <- lapply(groups_mmr, function(g) {
+  cells_in_group <- rownames(meta_mmr)[meta_mmr$pb_group == g]
+  if (length(cells_in_group) < 10) return(NULL)
+  Matrix::rowSums(counts_mmr[, cells_in_group, drop = FALSE])
+})
+names(pb_list_mmr) <- groups_mmr
+pb_list_mmr <- pb_list_mmr[!sapply(pb_list_mmr, is.null)]
+
+# 2e. Assemble pseudobulk count matrix
+pb_counts_mmr <- do.call(cbind, pb_list_mmr)
+
+# 2f. Sample metadata table for DESeq2
+pb_meta_mmr <- data.frame(
+  sample    = names(pb_list_mmr),
+  PID       = sub("__.*$", "", names(pb_list_mmr)),
+  MMRStatus = sub("^.*__", "", names(pb_list_mmr)),
+  row.names = names(pb_list_mmr),
+  stringsAsFactors = FALSE
+)
+pb_meta_mmr$MMRStatus <- factor(pb_meta_mmr$MMRStatus, levels = c("MMRp", "MMRd"))
+# MMRp is the reference level (denominator); MMRd is the numerator
 
 cat(sprintf("  Pseudobulk samples: %d total (MMRd=%d, MMRp=%d)\n",
-            nrow(pb_mmr$coldata),
-            sum(pb_mmr$coldata$MMRStatus == "MMRd"),
-            sum(pb_mmr$coldata$MMRStatus == "MMRp")))
+            nrow(pb_meta_mmr),
+            sum(pb_meta_mmr$MMRStatus == "MMRd"),
+            sum(pb_meta_mmr$MMRStatus == "MMRp")))
 
-de_mmr <- run_deseq2(pb_mmr, condition_col = "MMRStatus",
-                     level1 = "MMRd", level2 = "MMRp")
+stopifnot(sum(pb_meta_mmr$MMRStatus == "MMRd") >= 3,
+          sum(pb_meta_mmr$MMRStatus == "MMRp") >= 3)
+
+# 2g. Filter lowly expressed genes
+keep_genes_mmr <- rowSums(pb_counts_mmr >= 1) >= 2
+pb_counts_mmr  <- pb_counts_mmr[keep_genes_mmr, ]
+
+# 2h. DESeq2
+dds_mmr <- DESeqDataSetFromMatrix(
+  countData = as.matrix(pb_counts_mmr),
+  colData   = pb_meta_mmr,
+  design    = ~ MMRStatus
+)
+dds_mmr <- DESeq(dds_mmr, quiet = TRUE)
+
+# 2i. Results: MMRd vs MMRp
+de_mmr      <- as.data.frame(results(dds_mmr, contrast = c("MMRStatus", "MMRd", "MMRp")))
+de_mmr$gene <- rownames(de_mmr)
 
 write.csv(de_mmr, file.path(result_dir, "de_mmrd_vs_mmrp_myeloid.csv"), row.names = FALSE)
 cat(sprintf("  DE genes (|log2FC| > 0.5, padj < 0.05): up in MMRd=%d, up in MMRp=%d\n",
             sum(de_mmr$log2FoldChange >  0.5 & de_mmr$padj < 0.05, na.rm = TRUE),
             sum(de_mmr$log2FoldChange < -0.5 & de_mmr$padj < 0.05, na.rm = TRUE)))
 
+# 2j. Volcano plot
 p_volcano_mmr <- EnhancedVolcano(de_mmr,
   lab = de_mmr$gene, x = "log2FoldChange", y = "padj",
   title    = "Myeloid: MMRd vs MMRp",
@@ -173,66 +225,124 @@ p_volcano_mmr <- EnhancedVolcano(de_mmr,
 ggsave(file.path(result_dir, "volcano_mmrd_vs_mmrp.pdf"), p_volcano_mmr, width = 10, height = 8)
 ggsave(file.path(result_dir, "volcano_mmrd_vs_mmrp.png"), p_volcano_mmr, width = 10, height = 8, dpi = 200)
 
-rm(seu_mmr); gc()
+rm(seu_mmr, counts_mmr, meta_mmr, pb_list_mmr, pb_counts_mmr, pb_meta_mmr, dds_mmr); gc()
 
-# =========================================================================
-# DE 3: Per-subcluster Tumor vs Normal — PSEUDOBULK
-# =========================================================================
-cat("\n--- DE: Tumor vs Normal per myeloid subcluster — Pseudobulk DESeq2 ---\n")
 
-subclusters      <- unique(seu$cl295v11SubShort)
-de_per_cluster   <- list()
+# =============================================================================
+# STEP 3: Tumor vs Normal — per myeloid subcluster (pseudobulk DESeq2)
+# Input:  seu,  cl295v11SubShort (cM01–cM10),  SPECIMEN_TYPE
+#         Skips clusters with < 3 pseudobulk samples in either condition.
+# Output: de_TvsN_<cluster>.csv  (one file per subcluster)
+#         de_TvsN_all_subclusters.csv  (all clusters combined)
+# =============================================================================
+cat("\n--- STEP 3: Tumor vs Normal per myeloid subcluster ---\n")
+
+subclusters    <- unique(seu$cl295v11SubShort)
+de_per_cluster <- list()
 
 for (sc in subclusters) {
   cat(sprintf("  Processing %s...\n", sc))
-  seu_sub <- subset(seu, subset = cl295v11SubShort == sc &
-                                  SPECIMEN_TYPE %in% c("T", "N"))
 
-  pb_sub <- make_pseudobulk(seu_sub, condition_col = "SPECIMEN_TYPE")
+  # 3a. Subset to this subcluster's T and N cells
+  seu_sc <- subset(seu, subset = cl295v11SubShort == sc &
+                                 SPECIMEN_TYPE %in% c("T", "N"))
 
-  n_t <- sum(pb_sub$coldata$SPECIMEN_TYPE == "T")
-  n_n <- sum(pb_sub$coldata$SPECIMEN_TYPE == "N")
+  # 3b. Raw counts for this subcluster
+  counts_sc <- GetAssayData(seu_sc, slot = "counts", assay = "RNA")
 
-  if (n_t >= 3 & n_n >= 3) {
-    de <- tryCatch(
-      run_deseq2(pb_sub, condition_col = "SPECIMEN_TYPE",
-                 level1 = "T", level2 = "N"),
-      error = function(e) { message("    Error: ", e$message); NULL }
-    )
-    if (!is.null(de)) {
-      de$cluster <- sc
-      de_per_cluster[[sc]] <- de
-      write.csv(de, file.path(result_dir, paste0("de_TvsN_", sc, ".csv")),
-                row.names = FALSE)
-      cat(sprintf("    %d DE genes found (padj < 0.05)\n",
-                  sum(de$padj < 0.05, na.rm = TRUE)))
-    }
-  } else {
+  # 3c. Pseudobulk group labels
+  meta_sc <- seu_sc@meta.data[, c("PID", "SPECIMEN_TYPE")]
+  meta_sc$pb_group <- paste(meta_sc$PID, meta_sc$SPECIMEN_TYPE, sep = "__")
+
+  # 3d. Sum counts per PID × condition group
+  groups_sc <- unique(meta_sc$pb_group)
+  pb_list_sc <- lapply(groups_sc, function(g) {
+    cells_in_group <- rownames(meta_sc)[meta_sc$pb_group == g]
+    if (length(cells_in_group) < 10) return(NULL)
+    Matrix::rowSums(counts_sc[, cells_in_group, drop = FALSE])
+  })
+  names(pb_list_sc) <- groups_sc
+  pb_list_sc <- pb_list_sc[!sapply(pb_list_sc, is.null)]
+
+  pb_counts_sc <- do.call(cbind, pb_list_sc)
+
+  # 3e. Sample metadata
+  pb_meta_sc <- data.frame(
+    PID           = sub("__.*$", "", names(pb_list_sc)),
+    SPECIMEN_TYPE = sub("^.*__", "", names(pb_list_sc)),
+    row.names     = names(pb_list_sc),
+    stringsAsFactors = FALSE
+  )
+  pb_meta_sc$SPECIMEN_TYPE <- factor(pb_meta_sc$SPECIMEN_TYPE, levels = c("N", "T"))
+
+  n_t <- sum(pb_meta_sc$SPECIMEN_TYPE == "T")
+  n_n <- sum(pb_meta_sc$SPECIMEN_TYPE == "N")
+
+  # 3f. Need at least 3 patients per condition to run DESeq2
+  if (n_t < 3 | n_n < 3) {
     cat(sprintf("    Skipped (pseudobulk T=%d, N=%d patients)\n", n_t, n_n))
+    next
+  }
+
+  # 3g. Filter genes, run DESeq2, extract results
+  keep_sc      <- rowSums(pb_counts_sc >= 1) >= 2
+  pb_counts_sc <- pb_counts_sc[keep_sc, ]
+
+  de_sc <- tryCatch({
+    dds_sc <- DESeqDataSetFromMatrix(
+      countData = as.matrix(pb_counts_sc),
+      colData   = pb_meta_sc,
+      design    = ~ SPECIMEN_TYPE
+    )
+    dds_sc <- DESeq(dds_sc, quiet = TRUE)
+    res    <- as.data.frame(results(dds_sc, contrast = c("SPECIMEN_TYPE", "T", "N")))
+    res$gene    <- rownames(res)
+    res$cluster <- sc
+    res
+  }, error = function(e) { message("    Error: ", e$message); NULL })
+
+  if (!is.null(de_sc)) {
+    de_per_cluster[[sc]] <- de_sc
+    write.csv(de_sc, file.path(result_dir, paste0("de_TvsN_", sc, ".csv")),
+              row.names = FALSE)
+    cat(sprintf("    %d DE genes found (padj < 0.05)\n",
+                sum(de_sc$padj < 0.05, na.rm = TRUE)))
   }
 }
 
+# 3h. Combine all subclusters into one table
 if (length(de_per_cluster) > 0) {
   de_all <- bind_rows(de_per_cluster)
   write.csv(de_all, file.path(result_dir, "de_TvsN_all_subclusters.csv"),
             row.names = FALSE)
 }
 
-# =========================================================================
-# DE 4: Macrophage subtype contrasts — Wilcoxon (cell-type comparison, not
-#        condition comparison, so pseudobulk is not required here)
-# =========================================================================
-cat("\n--- DE: Macrophage subtype contrasts (Wilcoxon) ---\n")
 
+# =============================================================================
+# STEP 4: Macrophage (cM02) vs Monocyte (cM01) — cell-type marker contrast
+# Input:  seu subset to cM01 + cM02
+# Output: de_macrophage_vs_monocyte.csv
+#         volcano_macrophage_vs_monocyte.pdf / .png
+# Note:   Wilcoxon is correct here — comparing two cell identities within the
+#         same samples, not a condition across patients (no pseudoreplication).
+# =============================================================================
+cat("\n--- STEP 4: Macrophage (cM02) vs Monocyte (cM01) markers ---\n")
+
+# 4a. Subset to just these two clusters
 seu_mac_mono <- subset(seu, subset = cl295v11SubShort %in% c("cM02", "cM01"))
+
+# 4b. Set cluster as the active identity so FindMarkers knows what to compare
 Idents(seu_mac_mono) <- "cl295v11SubShort"
 
-de_mac_mono <- FindMarkers(seu_mac_mono, ident.1 = "cM02", ident.2 = "cM01",
-                           test.use = "wilcox", logfc.threshold = 0.1,
-                           min.pct = 0.1, verbose = FALSE)
-de_mac_mono$gene <- rownames(de_mac_mono)
+# 4c. Wilcoxon rank-sum test: cM02 (macrophage) vs cM01 (monocyte)
+#     avg_log2FC > 0 means higher in macrophage
+de_mac_mono       <- FindMarkers(seu_mac_mono, ident.1 = "cM02", ident.2 = "cM01",
+                                 test.use = "wilcox", logfc.threshold = 0.1,
+                                 min.pct = 0.1, verbose = FALSE)
+de_mac_mono$gene  <- rownames(de_mac_mono)
 write.csv(de_mac_mono, file.path(result_dir, "de_macrophage_vs_monocyte.csv"))
 
+# 4d. Volcano plot (note: x-axis is avg_log2FC, y-axis is p_val_adj from Wilcoxon)
 p_volcano_mac <- EnhancedVolcano(de_mac_mono,
   lab = de_mac_mono$gene, x = "avg_log2FC", y = "p_val_adj",
   title    = "Macrophage (cM02) vs Monocyte (cM01)",
@@ -244,27 +354,35 @@ p_volcano_mac <- EnhancedVolcano(de_mac_mono,
 ggsave(file.path(result_dir, "volcano_macrophage_vs_monocyte.pdf"), p_volcano_mac, width = 10, height = 8)
 ggsave(file.path(result_dir, "volcano_macrophage_vs_monocyte.png"), p_volcano_mac, width = 10, height = 8, dpi = 200)
 
-# =========================================================================
-# DE 5: Top DE genes heatmap (Tumor vs Normal)
-# =========================================================================
-cat("\nGenerating DE heatmap...\n")
 
-top_up   <- de_tn %>% filter(padj < 0.05) %>% slice_max(n = 30, order_by = log2FoldChange)
-top_down <- de_tn %>% filter(padj < 0.05) %>% slice_min(n = 30, order_by = log2FoldChange)
+# =============================================================================
+# STEP 5: Top DE genes heatmap
+# Input:  de_tn  (Step 1 result, still in memory)
+#         seu    (full myeloid object, for average expression per subcluster)
+# Output: de_heatmap_TvsN_top_genes.pdf
+# =============================================================================
+cat("\n--- STEP 5: Top DE genes heatmap ---\n")
+
+# 5a. Select top 30 up- and down-regulated genes from Step 1
+top_up    <- de_tn %>% filter(padj < 0.05) %>% slice_max(n = 30, order_by = log2FoldChange)
+top_down  <- de_tn %>% filter(padj < 0.05) %>% slice_min(n = 30, order_by = log2FoldChange)
 top_genes <- c(top_up$gene, top_down$gene)
-top_genes <- top_genes[top_genes %in% rownames(seu)]
+top_genes <- top_genes[top_genes %in% rownames(seu)]   # keep only genes in the object
 
-avg_expr       <- AverageExpression(seu, features = top_genes,
-                                    group.by = "cl295v11SubFull")
-avg_mat        <- as.matrix(avg_expr$RNA)
+# 5b. Compute average expression of these genes per myeloid subcluster
+avg_expr <- AverageExpression(seu, features = top_genes, group.by = "cl295v11SubFull")
+avg_mat  <- as.matrix(avg_expr$RNA)
+
+# 5c. Z-score each gene across subclusters (so heatmap shows relative expression)
 avg_mat_scaled <- t(scale(t(avg_mat)))
 
+# 5d. Draw heatmap
 pdf(file.path(result_dir, "de_heatmap_TvsN_top_genes.pdf"), width = 10, height = 12)
 ht <- Heatmap(avg_mat_scaled, name = "Z-score",
-              col = colorRamp2(c(-2, 0, 2), c("#3498DB", "white", "#E74C3C")),
-              row_names_gp = gpar(fontsize = 7),
+              col             = colorRamp2(c(-2, 0, 2), c("#3498DB", "white", "#E74C3C")),
+              row_names_gp    = gpar(fontsize = 7),
               column_names_gp = gpar(fontsize = 8),
-              column_title = "Top DE Genes: Tumor vs Normal (Pseudobulk DESeq2)")
+              column_title    = "Top DE Genes: Tumor vs Normal (Pseudobulk DESeq2)")
 draw(ht)
 dev.off()
 
